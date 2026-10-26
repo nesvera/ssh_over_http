@@ -1,0 +1,10 @@
+# Dev credentials from scripts/gen-secrets.sh: never commit
+secrets/
+.env
+
+target/agent/node_modules/
+
+# Go build outputs (./sshtun is built by the README's host instructions)
+/sshtun
+/client/client
+/proxy/proxy

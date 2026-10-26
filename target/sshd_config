@@ -1,0 +1,13 @@
+# Only reachable through the agent: nothing outside the container can connect.
+ListenAddress 127.0.0.1
+Port 22
+
+HostKey /etc/ssh/ssh_host_ed25519_key
+
+PermitRootLogin no
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+AuthorizedKeysFile .ssh/authorized_keys
+
+Subsystem sftp internal-sftp

@@ -1,0 +1,16 @@
+{
+  "name": "ssh-tunnel-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Device agent that bridges multiplexed WebSocket streams to the local SSH server",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "ws": "8.18.0"
+  }
+}

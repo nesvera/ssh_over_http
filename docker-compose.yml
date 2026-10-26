@@ -1,0 +1,56 @@
+# client-net: client <-> proxy      device-net: proxy <-> target
+# The client has no route to the target; the WebSocket tunnel is the only path.
+# Run scripts/gen-secrets.sh (or `make secrets`) first.
+
+services:
+  proxy:
+    build: ./proxy
+    command: ["-listen", ":8443", "-cert", "/secrets/proxy.crt", "-key", "/secrets/proxy.key"]
+    environment:
+      AGENT_TOKENS: "${DEVICE_ID}=${AGENT_TOKEN}"
+      CLIENT_TOKENS: "${CLIENT_TOKEN}"
+    volumes:
+      - ./secrets/proxy.crt:/secrets/proxy.crt:ro
+      - ./secrets/proxy.key:/secrets/proxy.key:ro
+    ports:
+      - "8443:8443"
+    networks: [client-net, device-net]
+
+  target:
+    build: ./target
+    environment:
+      PROXY_URL: wss://proxy:8443
+      DEVICE_ID: "${DEVICE_ID}"
+      AGENT_TOKEN: "${AGENT_TOKEN}"
+      CA_FILE: /secrets/ca.crt
+      # Password-login user created at startup (see target/entrypoint.sh).
+      TARGET_USER: "${TARGET_USER}"
+      TARGET_PASSWORD: "${TARGET_PASSWORD}"
+    volumes:
+      - ./secrets/ca.crt:/secrets/ca.crt:ro
+      - ./secrets/host_ed25519:/secrets/host_ed25519:ro
+      - ./secrets/host_ed25519.pub:/secrets/host_ed25519.pub:ro
+      - ./secrets/client_ed25519.pub:/secrets/client_ed25519.pub:ro
+    networks: [device-net]
+    depends_on: [proxy]
+
+  client:
+    build: ./client
+    environment:
+      SSHTUN_PROXY: wss://proxy:8443
+      SSHTUN_TOKEN: "${CLIENT_TOKEN}"
+      SSHTUN_CA: /secrets/ca.crt
+      SSHTUN_USER: dev
+      SSHTUN_IDENTITY: /secrets/client_ed25519
+      SSHTUN_KNOWN_HOSTS: /secrets/known_hosts
+    volumes:
+      - ./secrets/ca.crt:/secrets/ca.crt:ro
+      - ./secrets/client_ed25519:/secrets/client_ed25519:ro
+      - ./secrets/known_hosts:/secrets/known_hosts:ro
+    networks: [client-net]
+    depends_on: [proxy]
+
+networks:
+  client-net: {}
+  device-net:
+    internal: true
