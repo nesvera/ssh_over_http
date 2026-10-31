@@ -41,6 +41,7 @@ client/            sshtun, the user-facing CLI (Go module)
   session.go       shell and exec commands
   cp.go            file copy over SFTP
   iface*.go        `tun`: virtual interface + userspace TCP/IP stack
+  dns.go           `tun`: MagicDNS-style device names (dev1.sshtun)
 proxy/             the relay server (Go module)
   main.go          flags, tokens, TLS
   internal/proxy/  HTTP endpoints, device registry, piping
@@ -164,7 +165,8 @@ ssh dev@10.77.0.2
 sshtun0 (TUN)  ── raw IP packets ──▶  netstack inside sshtun (pretends to be 10.77.0.2)
                                         │ TCP :22  → accept, then dialTunnel() → /connect → sshd
                                         │ ICMP echo → GET /ping → proxy pings the agent → reply
-                                        └ anything else → refused (TCP RST) or dropped
+                                        │ UDP :53  → answers dev1.sshtun = 10.77.0.2
+                                        └ anything else → refused or dropped
 ```
 
 - `tun.CreateTUN` (from wireguard-go) creates the interface (`sshtun0`,
@@ -185,7 +187,29 @@ sshtun0 (TUN)  ── raw IP packets ──▶  netstack inside sshtun (pretends
   agent, so `ping` shows real reachability and latency up to the agent. It
   doesn't check sshd itself.
 - SSH authentication and host key checking are done by your `ssh` client,
-  end to end. Its `known_hosts` entry is keyed by `10.77.0.2`, not `dev1`.
+  end to end. Its `known_hosts` entry is keyed by the name you connect to
+  (`dev1.sshtun` or `10.77.0.2`).
+
+**Device names** (`dns.go`), in the spirit of Tailscale's MagicDNS. Each
+`sshtun tun` process owns exactly one name, `<device>.sshtun`:
+
+- netstack runs a tiny DNS server on UDP port 53 **at the device's own
+  address** (`10.77.0.2:53`). It answers an A record for `dev1.sshtun`, an
+  empty answer for other record types such as AAAA (so resolvers don't wait),
+  and NXDOMAIN for any other name. Nothing is looked up remotely; the answer
+  is just the `-ip` address.
+- `registerName` then tells the OS to send queries for that one name there,
+  so other names keep using the normal resolver and several `sshtun tun`
+  processes can run side by side:
+
+  | System | How the name is registered | Cleanup |
+  |---|---|---|
+  | macOS | `/etc/resolver/dev1.sshtun` containing `nameserver 10.77.0.2` | file removed on exit |
+  | Linux with systemd-resolved | `resolvectl dns`/`domain ~dev1.sshtun` on the interface | goes away with the interface |
+  | Other Linux (e.g. the Alpine client container) | a tagged line in `/etc/hosts`, since `resolv.conf` can't route a single name to a single server | line removed on exit, or replaced on the next start after a crash |
+
+  In the last case the DNS server is still running (`nslookup dev1.sshtun
+  10.77.0.2`), but lookups are answered from `/etc/hosts`.
 - Ctrl-C closes the TUN, which removes the interface, address and route.
 
 ## Proxy (`proxy/`)
@@ -439,6 +463,10 @@ is given.
   no longer a gate, which matters while password login and the lockout issue
   remain. The client container also needs `NET_ADMIN` and `/dev/net/tun`
   (granted in `docker-compose.yml`) for this command only.
+- **`.sshtun` isn't a reserved domain.** If it ever became a real top-level
+  domain, the local names would shadow real ones. A real deployment should
+  use a subdomain of a domain it owns, as Tailscale does with `ts.net`. Names
+  also change `/etc/hosts` or `/etc/resolver`, which is why `tun` needs root.
 - **No audit trail.** sshd logs `127.0.0.1` for every session, and the proxy
   logs the remote address but not which credential was used. Together with
   the shared token, there's no record of who did what.
@@ -519,19 +547,23 @@ runs, so standard tools work against it. It needs root (or `CAP_NET_ADMIN`).
 ```sh
 # terminal 1 (inside the client container)
 sshtun tun dev1
-sshtun0: device dev1 is at 10.77.0.2 (ssh on port 22, ping); Ctrl-C to remove
+sshtun0: device dev1 is at dev1.sshtun (10.77.0.2, via /etc/hosts); ssh on port 22, ping; Ctrl-C to remove
 
 # terminal 2
-ping 10.77.0.2
-ssh -i /secrets/client_ed25519 dev@10.77.0.2
-scp -i /secrets/client_ed25519 app.tar dev@10.77.0.2:/tmp/
-ssh tester@10.77.0.2                       # password user
+ping dev1.sshtun
+ssh -i /secrets/client_ed25519 dev@dev1.sshtun
+scp -i /secrets/client_ed25519 app.tar dev@dev1.sshtun:/tmp/
+ssh tester@dev1.sshtun                     # password user
 ```
 
-Only port 22 is forwarded; other TCP ports are refused, and UDP and IPv6 are
-dropped. For more than one device, give each its own address:
-`sshtun tun -ip 10.77.1.2 -local 10.77.1.1 dev2`. On a macOS host, run it with
-`sudo`; the interface will be `utunN`.
+Only port 22 (and DNS for the device's name) is served; other TCP and UDP
+ports are refused, and IPv6 is dropped. For more than one device, give each
+its own address: `sshtun tun -ip 10.77.1.2 -local 10.77.1.1 dev2` (that one is
+`dev2.sshtun`). `-domain` changes the suffix, and `-domain ''` turns names
+off. The device ID must be a valid DNS label (letters, digits, hyphens). On a
+macOS host, run it with `sudo`; the interface will be `utunN`. Note that
+`dig` and `nslookup` on macOS bypass `/etc/resolver`; use `ping` or
+`dscacheutil -q host -a name dev1.sshtun` to check the name.
 
 ### From the host machine
 
@@ -557,7 +589,8 @@ entries. `FORCE=1 ./scripts/gen-secrets.sh` regenerates everything; run
 make test
 ```
 
-`proxy/internal/proxy/proxy_test.go` runs the real Node agent against the
+`client/dns_test.go` checks the DNS answers (A, AAAA, unknown names, case)
+and device-name validation. `proxy/internal/proxy/proxy_test.go` runs the real Node agent against the
 proxy, with a TCP echo server in place of sshd. It checks auth, unknown
 devices, `/ping`, and 8 concurrent 4 MiB streams for byte-exact round trips.
 

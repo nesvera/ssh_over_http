@@ -26,6 +26,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
@@ -37,7 +38,8 @@ import (
 //     its own tunnel to the device's sshd, exactly like `sshtun shell`.
 //   - ICMP echo is answered only after the proxy round-trips a ping to the
 //     device's agent, so ping reports real reachability and latency.
-//   - Everything else is refused (TCP RST) or dropped.
+//   - DNS on UDP port 53 answers the device's name, dev1.sshtun (dns.go).
+//   - Everything else is refused (TCP RST, ICMP port unreachable) or dropped.
 //
 // No IP packets cross the tunnel, so the device needs no TUN, privileges or
 // protocol changes; only the client needs root to create the interface.
@@ -57,6 +59,7 @@ func runTun(ctx context.Context, cfg *config, args []string) error {
 	deviceIP := fs.String("ip", "10.77.0.2", "IPv4 address the device appears at")
 	localIP := fs.String("local", "10.77.0.1", "IPv4 address of this machine on the link")
 	name := fs.String("name", defaultIfaceName, "interface name")
+	domain := fs.String("domain", "sshtun", "DNS domain for the device's name (<device>.<domain>); empty disables names")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Usage: sshtun tun [-ip addr] [-local addr] [-name ifname] <device>")
 		fs.PrintDefaults()
@@ -79,6 +82,12 @@ func runTun(ctx context.Context, cfg *config, args []string) error {
 	}
 	if peer == local {
 		return errors.New("-ip and -local must differ")
+	}
+	var dnsName string
+	if *domain != "" {
+		if dnsName, err = deviceName(device, *domain); err != nil {
+			return fmt.Errorf("%w; use -domain '' to run without a name", err)
+		}
 	}
 
 	hc, err := httpClient(cfg)
@@ -121,13 +130,29 @@ func runTun(ctx context.Context, cfg *config, args []string) error {
 	}
 	defer l.stack.Close()
 
+	where := peer.String()
+	if dnsName != "" {
+		dns, err := gonet.DialUDP(l.stack, &tcpip.FullAddress{NIC: 1, Addr: l.addr, Port: 53}, nil, ipv4.ProtocolNumber)
+		if err != nil {
+			return fmt.Errorf("dns: %w", err)
+		}
+		defer dns.Close()
+		go serveDNS(dns, dnsName, peer)
+		unregister, via, err := registerName(ifname, dnsName, peer)
+		if err != nil {
+			return fmt.Errorf("register %s: %w", dnsName, err)
+		}
+		defer unregister()
+		where = fmt.Sprintf("%s (%s, via %s)", dnsName, peer, via)
+	}
+
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go l.writeLoop(ctx)
 	errc := make(chan error, 1)
 	go func() { errc <- l.readLoop() }()
 
-	fmt.Fprintf(os.Stderr, "%s: device %s is at %s (ssh on port %d, ping); Ctrl-C to remove\n", ifname, device, peer, sshPort)
+	fmt.Fprintf(os.Stderr, "%s: device %s is at %s; ssh on port %d, ping; Ctrl-C to remove\n", ifname, device, where, sshPort)
 	select {
 	case <-ctx.Done():
 		fmt.Fprintf(os.Stderr, "%s: removed\n", ifname)
@@ -155,7 +180,7 @@ type link struct {
 func (l *link) startStack() error {
 	l.stack = stack.New(stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
-		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
 	})
 	sack := tcpip.TCPSACKEnabled(true)
 	l.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &sack)
