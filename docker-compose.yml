@@ -36,6 +36,9 @@ services:
 
   client:
     build: ./client
+    # Only for `sshtun tun`, which creates a TUN interface.
+    cap_add: [NET_ADMIN]
+    devices: ["/dev/net/tun:/dev/net/tun"]
     environment:
       SSHTUN_PROXY: wss://proxy:8443
       SSHTUN_TOKEN: "${CLIENT_TOKEN}"

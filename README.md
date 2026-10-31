@@ -40,6 +40,7 @@ client/            sshtun, the user-facing CLI (Go module)
   ssh.go           SSH handshake: host key check, key/password auth
   session.go       shell and exec commands
   cp.go            file copy over SFTP
+  iface*.go        `tun`: virtual interface + userspace TCP/IP stack
 proxy/             the relay server (Go module)
   main.go          flags, tokens, TLS
   internal/proxy/  HTTP endpoints, device registry, piping
@@ -120,7 +121,7 @@ WebSocket where `ssh` would use a TCP connection.
 `-user`/`SSHTUN_USER`, `-i`/`SSHTUN_IDENTITY`, and
 `-known-hosts`/`SSHTUN_KNOWN_HOSTS`. In the client container they're all set
 by `docker-compose.yml`, so commands work without flags. `run()` dispatches
-to `devices`, `shell`, `exec` or `cp`.
+to `devices`, `shell`, `exec`, `cp` or `tun`.
 
 **Opening the tunnel** (`tunnel.go`, `dialTunnel`). Connects to
 `/connect?device=<id>` with `Authorization: Bearer <token>`, trusting the CA
@@ -152,6 +153,41 @@ are simply different channel types:
   `device:path` syntax and a progress line.
 - `devices` is a plain HTTPS `GET /devices`; it doesn't use SSH.
 
+**Virtual interface** (`iface.go`, `tun`). Unlike the other commands, `tun`
+doesn't speak SSH itself. It gives the device an IP address on the client
+machine, so ordinary `ssh`, `scp`, `rsync` and `ping` can be used directly:
+
+```
+ssh dev@10.77.0.2
+  │  kernel: route 10.77.0.2 → sshtun0
+  ▼
+sshtun0 (TUN)  ── raw IP packets ──▶  netstack inside sshtun (pretends to be 10.77.0.2)
+                                        │ TCP :22  → accept, then dialTunnel() → /connect → sshd
+                                        │ ICMP echo → GET /ping → proxy pings the agent → reply
+                                        └ anything else → refused (TCP RST) or dropped
+```
+
+- `tun.CreateTUN` (from wireguard-go) creates the interface (`sshtun0`,
+  `sshtun1`, … on Linux; `utunN` on macOS), and `configureInterface` gives
+  it a point-to-point link: `10.77.0.1` for this machine and `10.77.0.2` for
+  the device by default.
+- Packets read from the TUN are handed to **gVisor netstack**, a TCP/IP stack
+  written in Go that runs inside sshtun and owns the address `10.77.0.2`. It
+  completes the TCP handshake, so each SSH connection becomes a normal byte
+  stream, which is piped into its own `/connect` WebSocket, exactly like
+  `sshtun shell`. The connection is accepted only once the tunnel is up, so an
+  unreachable device shows as "connection refused".
+- **IP packets never cross the tunnel.** The proxy and agent see the same
+  streams as always, so the device needs no TUN, no privileges and no
+  protocol change.
+- ICMP echo is intercepted before netstack (which would otherwise answer it
+  locally). It's answered only after the proxy round-trips a ping to the
+  agent, so `ping` shows real reachability and latency up to the agent. It
+  doesn't check sshd itself.
+- SSH authentication and host key checking are done by your `ssh` client,
+  end to end. Its `known_hosts` entry is keyed by `10.77.0.2`, not `dev1`.
+- Ctrl-C closes the TUN, which removes the interface, address and route.
+
 ## Proxy (`proxy/`)
 
 The proxy has two jobs: keep track of which devices are connected, and pair
@@ -168,6 +204,7 @@ reach any device for now). It serves HTTPS when given `-cert`/`-key`.
 | `GET /agent?device=dev1` | agent | Checks that device's token, upgrades to WebSocket, and registers it |
 | `GET /connect?device=dev1` | sshtun | Checks the client token, opens a stream to the device, and pipes bytes |
 | `GET /devices` | sshtun | Lists connected device IDs as JSON |
+| `GET /ping?device=dev1` | sshtun `tun` | Round-trips a WebSocket ping to the agent: 204, 404 if not connected, 504 if it doesn't answer |
 | `GET /healthz` | monitoring | Returns `ok` |
 
 **The device registry** (`register`, `unregister`, `lookup`). A map from
@@ -395,6 +432,13 @@ is given.
 
 ### Low
 
+- **`sshtun tun` shares access with the whole client machine.** While it
+  runs, any local user or process can reach the device's sshd at its address
+  without knowing `CLIENT_TOKEN`. If IP forwarding is on, so can other hosts
+  that route to it. SSH authentication still applies, but the proxy token is
+  no longer a gate, which matters while password login and the lockout issue
+  remain. The client container also needs `NET_ADMIN` and `/dev/net/tun`
+  (granted in `docker-compose.yml`) for this command only.
 - **No audit trail.** sshd logs `127.0.0.1` for every session, and the proxy
   logs the remote address but not which credential was used. Together with
   the shared token, there's no record of who did what.
@@ -415,6 +459,7 @@ is given.
 | Proxy restarts or the network drops | Open sessions end; the agent reconnects within seconds |
 | Network dies silently | Missed pings: the proxy drops the agent within about 30 s, and the agent reconnects within 60 s |
 | One client killed mid-transfer | Only that stream closes; other sessions on the same device continue |
+| Device offline while `sshtun tun` runs | `ping` gets no replies; `ssh` gets "connection refused"; both recover when the agent reconnects |
 | Malformed frame | The side that received it closes the WebSocket; the agent reconnects |
 
 ---
@@ -466,6 +511,28 @@ attempts. For scripts, `SSHTUN_PASSWORD` supplies the password without a
 prompt. To use a different user or password, edit `.env` and run
 `docker compose up -d target`.
 
+### Virtual interface
+
+`sshtun tun` gives a device an IP address on your machine for as long as it
+runs, so standard tools work against it. It needs root (or `CAP_NET_ADMIN`).
+
+```sh
+# terminal 1 (inside the client container)
+sshtun tun dev1
+sshtun0: device dev1 is at 10.77.0.2 (ssh on port 22, ping); Ctrl-C to remove
+
+# terminal 2
+ping 10.77.0.2
+ssh -i /secrets/client_ed25519 dev@10.77.0.2
+scp -i /secrets/client_ed25519 app.tar dev@10.77.0.2:/tmp/
+ssh tester@10.77.0.2                       # password user
+```
+
+Only port 22 is forwarded; other TCP ports are refused, and UDP and IPv6 are
+dropped. For more than one device, give each its own address:
+`sshtun tun -ip 10.77.1.2 -local 10.77.1.1 dev2`. On a macOS host, run it with
+`sudo`; the interface will be `utunN`.
+
 ### From the host machine
 
 The proxy is also published on `localhost:8443`:
@@ -492,7 +559,7 @@ make test
 
 `proxy/internal/proxy/proxy_test.go` runs the real Node agent against the
 proxy, with a TCP echo server in place of sshd. It checks auth, unknown
-devices, and 8 concurrent 4 MiB streams for byte-exact round trips.
+devices, `/ping`, and 8 concurrent 4 MiB streams for byte-exact round trips.
 
 ## Next steps
 

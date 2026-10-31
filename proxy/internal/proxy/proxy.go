@@ -50,6 +50,7 @@ func (p *Server) Handler() http.Handler {
 	m.HandleFunc("GET /agent", p.handleAgent)
 	m.HandleFunc("GET /connect", p.handleConnect)
 	m.HandleFunc("GET /devices", p.handleDevices)
+	m.HandleFunc("GET /ping", p.handlePing)
 	m.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "ok\n") })
 	return m
 }
@@ -124,6 +125,27 @@ func (p *Server) handleDevices(w http.ResponseWriter, r *http.Request) {
 	sort.Strings(devices)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(devices)
+}
+
+// handlePing round-trips a WebSocket ping to the device's agent, so clients
+// can measure reachability and latency all the way to the device.
+func (p *Server) handlePing(w http.ResponseWriter, r *http.Request) {
+	if !p.clientAuthorized(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	sess := p.lookup(r.URL.Query().Get("device"))
+	if sess == nil {
+		http.Error(w, "device not connected", http.StatusNotFound)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), pingTimeout)
+	defer cancel()
+	if err := sess.Ping(ctx); err != nil {
+		http.Error(w, "device did not answer", http.StatusGatewayTimeout)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (p *Server) register(device string, sess *mux.Session) {

@@ -39,6 +39,21 @@ func TestAgentInterop(t *testing.T) {
 		}
 	})
 
+	t.Run("ping", func(t *testing.T) {
+		for device, want := range map[string]int{"dev1": http.StatusNoContent, "nope": http.StatusNotFound} {
+			req, _ := http.NewRequest(http.MethodGet, baseURL+"/ping?device="+device, nil)
+			req.Header.Set("Authorization", "Bearer client-token")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != want {
+				t.Errorf("ping %s: got %s, want %d", device, resp.Status, want)
+			}
+		}
+	})
+
 	t.Run("concurrent bulk echo", func(t *testing.T) {
 		const streams, size = 8, 4 << 20
 		var wg sync.WaitGroup

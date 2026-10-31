@@ -124,3 +124,27 @@ func listDevices(ctx context.Context, cfg *config) error {
 	}
 	return nil
 }
+
+// pingDevice asks the proxy to round-trip a ping to the device's agent.
+func pingDevice(ctx context.Context, hc *http.Client, cfg *config, device string) error {
+	u, err := endpoint(cfg, "/ping", url.Values{"device": {device}}, false)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return err
+	}
+	req.Header = authHeader(cfg)
+	resp, err := hc.Do(req)
+	if err != nil {
+		return err
+	}
+	// Drain so the connection is reused and later pings measure one round trip.
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		return errors.New("proxy: " + resp.Status)
+	}
+	return nil
+}

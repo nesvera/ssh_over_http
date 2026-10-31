@@ -6,6 +6,7 @@ COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -o /out/sshtun .
 
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates
+# openssh-client is for trying ssh/scp through `sshtun tun`.
+RUN apk add --no-cache ca-certificates openssh-client
 COPY --from=build /out/sshtun /usr/local/bin/sshtun
 CMD ["sleep", "infinity"]
