@@ -23,7 +23,9 @@ import (
 // echo server standing in for sshd, and pushes several large transfers
 // through concurrently to exercise multiplexing and flow control.
 func TestAgentInterop(t *testing.T) {
-	baseURL := startStack(t, startEcho(t))
+	extra := startEcho(t) // a second allowed service besides "sshd"
+	baseURL := startStack(t, startEcho(t), extra)
+	_, extraPort, _ := net.SplitHostPort(extra.Addr().String())
 
 	t.Run("rejects bad client token", func(t *testing.T) {
 		_, resp, err := dial(baseURL, "dev1", "wrong")
@@ -36,6 +38,26 @@ func TestAgentInterop(t *testing.T) {
 		_, resp, err := dial(baseURL, "nope", "client-token")
 		if err == nil || resp == nil || resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("want 404, got resp=%v err=%v", resp, err)
+		}
+	})
+
+	t.Run("ports", func(t *testing.T) {
+		conn, _, err := dial(baseURL, "dev1&port="+extraPort, "client-token")
+		if err != nil {
+			t.Fatalf("allowed port: %v", err)
+		}
+		conn.Write([]byte("hi"))
+		got := make([]byte, 2)
+		if _, err := io.ReadFull(conn, got); err != nil || string(got) != "hi" {
+			t.Errorf("allowed port: got %q, %v", got, err)
+		}
+		conn.Close()
+
+		for port, want := range map[string]int{"1": http.StatusBadGateway, "0": http.StatusBadRequest, "x": http.StatusBadRequest} {
+			_, resp, err := dial(baseURL, "dev1&port="+port, "client-token")
+			if err == nil || resp == nil || resp.StatusCode != want {
+				t.Errorf("port %s: want %d, got resp=%v err=%v", port, want, resp, err)
+			}
 		}
 	})
 
@@ -87,7 +109,8 @@ func TestAgentInterop(t *testing.T) {
 
 // startStack runs the proxy plus the Node.js agent, whose "sshd" is whatever
 // listens on target, and returns the proxy's base URL once the agent is up.
-func startStack(t *testing.T, target net.Listener) string {
+// The agent also allows streams to the ports of extra.
+func startStack(t *testing.T, target net.Listener, extra ...net.Listener) string {
 	t.Helper()
 	node, err := exec.LookPath("node")
 	if err != nil {
@@ -106,12 +129,18 @@ func startStack(t *testing.T, target net.Listener) string {
 	t.Cleanup(ts.Close)
 
 	_, port, _ := net.SplitHostPort(target.Addr().String())
+	allowed := []string{port}
+	for _, l := range extra {
+		_, p, _ := net.SplitHostPort(l.Addr().String())
+		allowed = append(allowed, p)
+	}
 	agent := exec.Command(node, filepath.Join(agentDir, "src", "index.js"))
 	agent.Env = append(os.Environ(),
 		"PROXY_URL=ws"+strings.TrimPrefix(ts.URL, "http"),
 		"DEVICE_ID=dev1",
 		"AGENT_TOKEN=agent-token",
 		"SSH_PORT="+port,
+		"ALLOWED_PORTS="+strings.Join(allowed, ","),
 	)
 	agent.Stdout, agent.Stderr = testWriter{t}, testWriter{t}
 	if err := agent.Start(); err != nil {

@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"io"
 	"sync"
 
@@ -16,6 +15,11 @@ var (
 	ErrSessionClosed = errors.New("mux: session closed")
 	ErrStreamClosed  = errors.New("mux: stream closed")
 )
+
+// RefusedError is returned by Open when the agent answers OPEN_FAIL.
+type RefusedError struct{ Reason string }
+
+func (e *RefusedError) Error() string { return "mux: agent refused stream: " + e.Reason }
 
 // Session multiplexes streams over one WebSocket connected to an agent.
 type Session struct {
@@ -91,7 +95,7 @@ func (s *Session) Run() error {
 			st.resolveOpen(nil)
 		case FrameOpenFail:
 			s.remove(id)
-			st.resolveOpen(fmt.Errorf("mux: agent refused stream: %s", payload))
+			st.resolveOpen(&RefusedError{Reason: string(payload)})
 		case FrameData:
 			if err := st.pushData(payload); err != nil {
 				st.Close()
@@ -107,8 +111,9 @@ func (s *Session) Run() error {
 	}
 }
 
-// Open asks the agent for a new stream to its SSH server.
-func (s *Session) Open(ctx context.Context) (*Stream, error) {
+// Open asks the agent for a new stream to a TCP port on the device; port 0
+// means the device's SSH server.
+func (s *Session) Open(ctx context.Context, port uint16) (*Stream, error) {
 	s.mu.Lock()
 	if s.err != nil {
 		s.mu.Unlock()
@@ -120,7 +125,11 @@ func (s *Session) Open(ctx context.Context) (*Stream, error) {
 	s.streams[id] = st
 	s.mu.Unlock()
 
-	if err := s.writeFrame(FrameOpen, id, uint32Bytes(InitialWindow)); err != nil {
+	open := uint32Bytes(InitialWindow)
+	if port != 0 {
+		open = binary.BigEndian.AppendUint16(open, port)
+	}
+	if err := s.writeFrame(FrameOpen, id, open); err != nil {
 		s.remove(id)
 		return nil, err
 	}
@@ -166,7 +175,7 @@ func (s *Session) shutdown(err error) {
 	close(s.done)
 }
 
-// Stream is one bidirectional byte stream to the agent's SSH server.
+// Stream is one bidirectional byte stream to a TCP port on the device.
 type Stream struct {
 	id uint32
 	s  *Session

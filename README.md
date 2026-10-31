@@ -17,8 +17,10 @@ The idea in one paragraph: the device runs a small **agent** that connects
 **`sshtun`**, it connects to the same proxy and asks for a device by name. The
 proxy carves a new stream out of that device's WebSocket and joins the two.
 SSH then runs end to end, from `sshtun` to the device's sshd, through that
-path. The proxy and agent only move encrypted bytes; they never see what's
-inside.
+path. For SSH, the proxy and agent only move encrypted bytes; they never see
+what's inside. `sshtun tun` extends this to other TCP ports the device allows,
+which are only as private as their own protocol (see
+[known risks](#known-risks)).
 
 ## Quick start
 
@@ -58,6 +60,127 @@ Each folder builds on its own (`docker build ./proxy`, and so on).
 ---
 
 # How it works
+
+## Architecture
+
+```mermaid
+flowchart LR
+  subgraph clientnet["client-net"]
+    subgraph client["client container"]
+      apps["ssh · scp · curl · ping"]
+      tunif["sshtun0 (TUN)<br/>10.77.0.1 ⇄ 10.77.0.2"]
+      tun["sshtun tun<br/>netstack · DNS · ping"]
+      cli["sshtun shell / exec / cp<br/>built-in SSH client"]
+      apps -->|"IP packets"| tunif --> tun
+    end
+  end
+
+  subgraph proxyc["proxy container (on both networks)"]
+    ep["HTTPS :8443<br/>/agent · /connect · /ping · /devices"]
+    reg["device registry<br/>dev1 → mux session"]
+    ep --- reg
+  end
+
+  subgraph devicenet["device-net (internal, no internet)"]
+    subgraph target["target container"]
+      agent["agent (Node)<br/>mux · ALLOWED_PORTS"]
+      sshd["sshd<br/>127.0.0.1:22"]
+      svc["other services<br/>127.0.0.1:N"]
+      agent -->|"TCP"| sshd
+      agent -.->|"TCP, if allowed"| svc
+    end
+  end
+
+  cli -->|"WSS /connect<br/>one per SSH connection"| ep
+  tun -->|"WSS /connect?port=N<br/>GET /ping"| ep
+  agent ==>|"WSS /agent<br/>one outbound socket, multiplexed"| ep
+```
+
+| Component | Runs | Role |
+|---|---|---|
+| `sshtun` | client | CLI. `shell`/`exec`/`cp` speak SSH themselves; `tun` gives the device an address and name so ordinary tools work |
+| proxy | between the networks | Authenticates both sides, keeps the device registry, and splices each client WebSocket onto a stream of the device's socket |
+| agent | device | Keeps one outbound WebSocket to the proxy and turns each stream into a local TCP connection, if the port is allowed |
+| sshd | device | Normal OpenSSH; only listens on `127.0.0.1`, so the agent is the only way in |
+
+## Network flow
+
+Every connection that crosses a network is HTTPS to the proxy, and both
+sides dial **out** to it. The device never accepts a connection, so its
+firewall only needs to allow outbound 443/8443.
+
+| From | To | Port | Protocol | Lifetime |
+|---|---|---|---|---|
+| agent (device) | proxy | 8443/tcp | WSS `/agent` | Permanent; reconnects with backoff |
+| `sshtun` (client) | proxy | 8443/tcp | WSS `/connect` | One per SSH session or TCP connection |
+| `sshtun` (client) | proxy | 8443/tcp | HTTPS `/devices`, `/ping` | One request |
+| agent | sshd / allowed services | `127.0.0.1:22` / `:N` | TCP | One per stream |
+| ssh, curl, ping on the client | `sshtun0` → `sshtun tun` | `10.77.0.2` | IP (never leaves the machine) | While `tun` runs |
+
+**An SSH session through `sshtun tun`** (`sshtun shell` is the same from step 5
+on, with sshtun itself as the SSH client):
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant U as ssh (client)
+  participant T as sshtun tun<br/>(TUN + netstack)
+  participant P as proxy
+  participant A as agent
+  participant S as sshd
+
+  Note over A,P: at device startup, and after any disconnect
+  A->>P: WSS GET /agent?device=dev1 (agent token)
+  P-->>A: 101 Switching Protocols: dev1 registered
+  loop every 20 s
+    P->>A: WebSocket ping
+    A-->>P: pong
+  end
+
+  U->>U: resolve dev1.sshtun → 10.77.0.2
+  U->>T: TCP SYN to 10.77.0.2:22 (kernel routes it into sshtun0)
+  T->>P: WSS GET /connect?device=dev1 (client token)
+  P->>A: OPEN stream 7 (receive window)
+  A->>S: TCP connect 127.0.0.1:22
+  A-->>P: OPEN_OK stream 7
+  P-->>T: 101 Switching Protocols
+  T-->>U: SYN-ACK (netstack completes the handshake)
+
+  Note over U,S: SSH handshake and session, encrypted all the way from ssh to sshd
+  U->>T: TCP segments
+  T->>P: WebSocket messages
+  P->>A: DATA stream 7
+  A->>S: bytes
+  S-->>A: bytes
+  A-->>P: DATA stream 7 (WINDOW credit flows both ways)
+  P-->>T: WebSocket messages
+  T-->>U: TCP segments
+
+  S->>A: connection closed
+  A->>P: CLOSE stream 7
+  P->>T: WebSocket closed
+  T->>U: FIN
+```
+
+If the device isn't connected (404) or refuses the port (`OPEN_FAIL`, 502),
+`sshtun tun` answers the SYN with a reset instead, so the application sees
+"connection refused".
+
+**A ping**, answered only once the agent itself has responded:
+
+```mermaid
+sequenceDiagram
+  participant U as ping
+  participant T as sshtun tun
+  participant P as proxy
+  participant A as agent
+  U->>T: ICMP echo request to 10.77.0.2
+  T->>P: GET /ping?device=dev1
+  P->>A: WebSocket ping
+  A-->>P: pong
+  P-->>T: 204 No Content
+  T-->>U: ICMP echo reply
+```
 
 ## The life of one `sshtun shell dev1`
 
@@ -163,7 +286,7 @@ ssh dev@10.77.0.2
   │  kernel: route 10.77.0.2 → sshtun0
   ▼
 sshtun0 (TUN)  ── raw IP packets ──▶  netstack inside sshtun (pretends to be 10.77.0.2)
-                                        │ TCP :22  → accept, then dialTunnel() → /connect → sshd
+                                        │ TCP :N   → accept, then dialTunnel() → /connect?port=N → agent → 127.0.0.1:N
                                         │ ICMP echo → GET /ping → proxy pings the agent → reply
                                         │ UDP :53  → answers dev1.sshtun = 10.77.0.2
                                         └ anything else → refused or dropped
@@ -175,10 +298,15 @@ sshtun0 (TUN)  ── raw IP packets ──▶  netstack inside sshtun (pretends
   the device by default.
 - Packets read from the TUN are handed to **gVisor netstack**, a TCP/IP stack
   written in Go that runs inside sshtun and owns the address `10.77.0.2`. It
-  completes the TCP handshake, so each SSH connection becomes a normal byte
-  stream, which is piped into its own `/connect` WebSocket, exactly like
-  `sshtun shell`. The connection is accepted only once the tunnel is up, so an
-  unreachable device shows as "connection refused".
+  completes the TCP handshake, so each TCP connection becomes a normal byte
+  stream, which is piped into its own `/connect?port=N` WebSocket. Port 22
+  always means the device's SSH server (sent without a port, exactly like
+  `sshtun shell`). The connection is accepted only once the tunnel is up, so
+  an unreachable device or a port it doesn't allow shows as "connection
+  refused".
+- Because netstack ends the TCP connection locally and the agent opens a
+  fresh one, only bytes cross the tunnel. There's no TCP-over-TCP, which is
+  what makes packet-level VPNs over TCP slow under loss.
 - **IP packets never cross the tunnel.** The proxy and agent see the same
   streams as always, so the device needs no TUN, no privileges and no
   protocol change.
@@ -226,7 +354,7 @@ reach any device for now). It serves HTTPS when given `-cert`/`-key`.
 | Endpoint | Used by | What it does |
 |---|---|---|
 | `GET /agent?device=dev1` | agent | Checks that device's token, upgrades to WebSocket, and registers it |
-| `GET /connect?device=dev1` | sshtun | Checks the client token, opens a stream to the device, and pipes bytes |
+| `GET /connect?device=dev1[&port=N]` | sshtun | Checks the client token, opens a stream to the device's SSH server (or to port N), and pipes bytes |
 | `GET /devices` | sshtun | Lists connected device IDs as JSON |
 | `GET /ping?device=dev1` | sshtun `tun` | Round-trips a WebSocket ping to the agent: 204, 404 if not connected, 504 if it doesn't answer |
 | `GET /healthz` | monitoring | Returns `ok` |
@@ -241,8 +369,8 @@ and removes the device.
 **Pairing a client with a device** (`handleConnect`):
 1. Check the client token (401 if invalid).
 2. Look up the device (404 if not connected).
-3. Open a stream to the device and wait up to 10 seconds for `OPEN_OK` (502
-   if the agent can't reach sshd). This happens *before* accepting the
+3. Open a stream to the device and wait up to 10 seconds for `OPEN_OK` (502,
+   with the agent's reason, if the port isn't allowed or nothing listens). This happens *before* accepting the
    client's WebSocket, so failures reach sshtun as clear HTTP errors.
 4. Accept the client's WebSocket and `pipe()` bytes both ways until either
    side closes, then close both.
@@ -296,7 +424,11 @@ root login is off; `Subsystem sftp internal-sftp` enables file transfer.
 
 **Connecting to the proxy** (`agent/src/index.js`). Settings come from
 `PROXY_URL`, `DEVICE_ID`, `AGENT_TOKEN`, and optionally `CA_FILE`, `SSH_HOST`
-and `SSH_PORT` (defaults `127.0.0.1:22`). `connect()`:
+and `SSH_PORT` (defaults `127.0.0.1:22`), and `ALLOWED_PORTS`. The agent
+decides what is reachable: `ALLOWED_PORTS` lists the TCP ports on `SSH_HOST`
+that clients may open, and defaults to just `SSH_PORT`. In
+`docker-compose.yml` it comes from `.env` (`ALLOWED_PORTS=22,8080`), so other
+services are opt-in per device. `connect()`:
 - **Dials out** to `/agent?device=<id>` with the agent token. Because the
   device makes the connection, this works from behind NAT and firewalls.
 - **On open**, creates a `Mux` on the socket. Everything after that happens
@@ -312,8 +444,10 @@ and `SSH_PORT` (defaults `127.0.0.1:22`). `connect()`:
 duplicate IDs and more than 64 streams at once. If the WebSocket closes,
 every sshd connection is closed too, so nothing is left behind. For one
 `Stream`:
-1. **Open.** On `OPEN`, connect to sshd. On success reply `OPEN_OK`; on
-   failure, for example when sshd is down, reply `OPEN_FAIL` with the reason.
+1. **Open.** On `OPEN`, check the requested port (sshd if none) against
+   `ALLOWED_PORTS` and connect to it. On success reply `OPEN_OK`; on failure,
+   for example a port that isn't allowed or sshd being down, reply
+   `OPEN_FAIL` with the reason.
 2. **Client → sshd.** Each `DATA` frame is written to the sshd socket.
 3. **sshd → client.** Data from sshd is queued and sent as `DATA` frames, as
    far as the proxy's credit allows.
@@ -329,9 +463,9 @@ Every binary WebSocket message is one frame:
 
 | Type | Name      | Direction     | Meaning | Payload |
 |------|-----------|---------------|---------|---------|
-| 0x01 | OPEN      | proxy → agent | A client wants a new connection | uint32 receive window |
-| 0x02 | OPEN_OK   | agent → proxy | sshd connection is ready | uint32 receive window |
-| 0x03 | OPEN_FAIL | agent → proxy | sshd connection failed | UTF-8 reason |
+| 0x01 | OPEN      | proxy → agent | A client wants a new connection | uint32 receive window, then optionally uint16 port (absent = SSH server) |
+| 0x02 | OPEN_OK   | agent → proxy | The TCP connection is ready | uint32 receive window |
+| 0x03 | OPEN_FAIL | agent → proxy | Port not allowed, or the connection failed | UTF-8 reason |
 | 0x04 | DATA      | both          | Stream bytes | up to 32 KiB |
 | 0x05 | CLOSE     | both          | Stream is finished | none |
 | 0x06 | WINDOW    | both          | "You may send N more bytes" | uint32 credit |
@@ -375,8 +509,9 @@ work together.
 | Device host key (`known_hosts`) | sshd → sshtun, end to end | The SSH server really is dev1, even if the proxy were compromised |
 | User key or password | sshtun → sshd, end to end | The user may log in as `dev` or `tester` |
 
-Because the last two checks are end to end, the proxy can route traffic but
-can't impersonate a device or read sessions. `scripts/gen-secrets.sh`
+Because the last two checks are end to end, the proxy can route SSH traffic
+but can't impersonate a device or read SSH sessions. Other ports opened with
+`ALLOWED_PORTS` don't get this protection (see [known risks](#known-risks)). `scripts/gen-secrets.sh`
 creates all of these for the dev environment: a dev CA and proxy
 certificate, the client key pair (its public half becomes `dev`'s
 `authorized_keys`), the device host key, a `known_hosts` entry pinning it as
@@ -426,6 +561,34 @@ second connection for the same device.
 
 ### Medium
 
+**Ports other than SSH are protected only by the client token.** Anything in
+`ALLOWED_PORTS` is reachable by every holder of `CLIENT_TOKEN`, with no login
+of its own unless the service has one. Unlike SSH, this traffic isn't
+encrypted end to end: TLS ends at the proxy, so the proxy, or anyone who
+compromises it, can read and change it. Services bound to `127.0.0.1` on the
+device, which usually trust local callers, become remotely reachable.
+*HTTPS services are partly covered.* If the service on the device
+terminates TLS itself, the tunnel carries TLS end to end and the proxy can't
+read or change the content. This only holds when the client **verifies the
+certificate**: it must cover the name used (`dev1.sshtun` or `10.77.0.2`) and
+chain to a trusted CA, or be pinned. With `curl -k` or a clicked-through
+browser warning, a compromised proxy can present its own certificate and
+read everything. Even then, the proxy still sees which device and port, the
+timing and sizes, and the TLS SNI hostname, and HTTPS doesn't change who may
+connect: the client token remains the only gate unless the service requires
+a login or client certificates.
+
+| Service on an allowed port | Proxy can read/change it | Who can connect |
+|---|---|---|
+| SSH | No (host key checked by the client) | Token holders with an SSH login |
+| HTTPS, certificate verified | No (sees metadata only) | Token holders, plus the service's own auth |
+| HTTPS, certificate not verified | Yes, by impersonating the server | Token holders, plus the service's own auth |
+| Plain HTTP or other plaintext | Yes | Every token holder |
+
+*Mitigation:* allow only services with their own authentication and TLS with
+verifiable certificates, or reach them with `ssh -L` instead, which keeps them
+inside SSH; add per-client, per-port rules on the proxy.
+
 **The agent runs as root.** Node runs as process 1 under `root`, though only
 sshd needs root. A bug in the agent or the `ws` library would give root on the
 device.
@@ -457,8 +620,8 @@ is given.
 ### Low
 
 - **`sshtun tun` shares access with the whole client machine.** While it
-  runs, any local user or process can reach the device's sshd at its address
-  without knowing `CLIENT_TOKEN`. If IP forwarding is on, so can other hosts
+  runs, any local user or process can reach the device's sshd, and every
+  other allowed port, at its address without knowing `CLIENT_TOKEN`. If IP forwarding is on, so can other hosts
   that route to it. SSH authentication still applies, but the proxy token is
   no longer a gate, which matters while password login and the lockout issue
   remain. The client container also needs `NET_ADMIN` and `/dev/net/tun`
@@ -483,6 +646,7 @@ is given.
 | Wrong client token | Proxy answers 401; sshtun prints it and exits 1 |
 | Device not connected | Proxy answers 404 |
 | Device's sshd is down | Agent replies `OPEN_FAIL`; proxy answers 502 |
+| Port not in `ALLOWED_PORTS` | Agent replies `OPEN_FAIL` (`port N not allowed`); proxy answers 502; through `tun`, "connection refused" |
 | Host key doesn't match | sshtun stops before sending any credentials (`key mismatch`) |
 | Proxy restarts or the network drops | Open sessions end; the agent reconnects within seconds |
 | Network dies silently | Missed pings: the proxy drops the agent within about 30 s, and the agent reconnects within 60 s |
@@ -547,17 +711,27 @@ runs, so standard tools work against it. It needs root (or `CAP_NET_ADMIN`).
 ```sh
 # terminal 1 (inside the client container)
 sshtun tun dev1
-sshtun0: device dev1 is at dev1.sshtun (10.77.0.2, via /etc/hosts); ssh on port 22, ping; Ctrl-C to remove
+sshtun0: device dev1 is at dev1.sshtun (10.77.0.2, via /etc/hosts); TCP ports the device allows, ping; Ctrl-C to remove
 
 # terminal 2
 ping dev1.sshtun
 ssh -i /secrets/client_ed25519 dev@dev1.sshtun
 scp -i /secrets/client_ed25519 app.tar dev@dev1.sshtun:/tmp/
 ssh tester@dev1.sshtun                     # password user
+wget -qO- http://dev1.sshtun:8080/         # any other port the device allows
 ```
 
-Only port 22 (and DNS for the device's name) is served; other TCP and UDP
-ports are refused, and IPv6 is dropped. For more than one device, give each
+Any TCP port works if the device's `ALLOWED_PORTS` lists it (by default only
+SSH). To try it, put `ALLOWED_PORTS=22,8080` in `.env`, run
+`docker compose up -d target`, and start something on the target:
+
+```sh
+docker compose exec -d target node -e "require('http').createServer((q, r) => r.end('hi\n')).listen(8080, '127.0.0.1')"
+```
+
+Ports that aren't allowed, or where nothing listens, are refused; `sshtun tun`
+logs the reason. UDP is refused except DNS for the device's name, and IPv6 is
+dropped. For more than one device, give each
 its own address: `sshtun tun -ip 10.77.1.2 -local 10.77.1.1 dev2` (that one is
 `dev2.sshtun`). `-domain` changes the suffix, and `-domain ''` turns names
 off. The device ID must be a valid DNS label (letters, digits, hyphens). On a

@@ -34,15 +34,17 @@ import (
 // kernel routes to that address arrive on a TUN interface and are fed to a
 // userspace TCP/IP stack (gVisor netstack) that plays the device's part:
 //
-//   - TCP to port 22 is accepted locally and each connection is carried over
-//     its own tunnel to the device's sshd, exactly like `sshtun shell`.
+//   - Each TCP connection is accepted locally and carried over its own
+//     tunnel to the same port on the device, if the device's agent allows
+//     that port (ALLOWED_PORTS). Port 22 always means the device's SSH
+//     server, wherever it listens; this is the same path `sshtun shell` uses.
 //   - ICMP echo is answered only after the proxy round-trips a ping to the
 //     device's agent, so ping reports real reachability and latency.
 //   - DNS on UDP port 53 answers the device's name, dev1.sshtun (dns.go).
-//   - Everything else is refused (TCP RST, ICMP port unreachable) or dropped.
+//   - Other UDP is refused (ICMP port unreachable); IPv6 is dropped.
 //
-// No IP packets cross the tunnel, so the device needs no TUN, privileges or
-// protocol changes; only the client needs root to create the interface.
+// No IP packets cross the tunnel, so the device needs no TUN or privileges;
+// only the client needs root to create the interface.
 
 const (
 	ifaceMTU = 1500
@@ -152,7 +154,7 @@ func runTun(ctx context.Context, cfg *config, args []string) error {
 	errc := make(chan error, 1)
 	go func() { errc <- l.readLoop() }()
 
-	fmt.Fprintf(os.Stderr, "%s: device %s is at %s; ssh on port %d, ping; Ctrl-C to remove\n", ifname, device, where, sshPort)
+	fmt.Fprintf(os.Stderr, "%s: device %s is at %s; TCP ports the device allows, ping; Ctrl-C to remove\n", ifname, device, where)
 	select {
 	case <-ctx.Done():
 		fmt.Fprintf(os.Stderr, "%s: removed\n", ifname)
@@ -301,19 +303,20 @@ func echoReply(ip header.IPv4) {
 	icmp.SetChecksum(^checksum.Checksum(icmp, 0))
 }
 
-// handleTCP runs for each new TCP connection to the device. SSH connections
-// are completed only once the tunnel is up, so an unreachable device shows
-// up as "connection refused" rather than an immediate hang-up.
+// handleTCP runs for each new TCP connection to the device. Connections are
+// completed only once the tunnel to the port is up, so an unreachable device
+// or a port it doesn't allow shows up as "connection refused" rather than an
+// immediate hang-up.
 func (l *link) handleTCP(r *tcp.ForwarderRequest) {
 	id := r.ID()
-	if id.LocalPort != sshPort {
-		r.Complete(true)
-		return
+	port := id.LocalPort
+	if port == sshPort {
+		port = 0 // the device's SSH server, whatever port it listens on
 	}
-	from := fmt.Sprintf("%s:%d", id.RemoteAddress, id.RemotePort)
-	remote, err := dialTunnel(context.Background(), l.cfg, l.device)
+	from := fmt.Sprintf("%s:%d -> port %d", id.RemoteAddress, id.RemotePort, id.LocalPort)
+	remote, err := dialTunnel(context.Background(), l.cfg, l.device, port)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "ssh from %s: %v\n", from, err)
+		fmt.Fprintf(os.Stderr, "%s: %v\n", from, err)
 		r.Complete(true)
 		return
 	}
@@ -325,9 +328,9 @@ func (l *link) handleTCP(r *tcp.ForwarderRequest) {
 		return
 	}
 	r.Complete(false)
-	fmt.Fprintf(os.Stderr, "ssh from %s: connected\n", from)
+	fmt.Fprintf(os.Stderr, "%s: connected\n", from)
 	pipe(gonet.NewTCPConn(&wq, ep), remote)
-	fmt.Fprintf(os.Stderr, "ssh from %s: closed\n", from)
+	fmt.Fprintf(os.Stderr, "%s: closed\n", from)
 }
 
 // pipe copies in both directions until either side finishes, then closes both.

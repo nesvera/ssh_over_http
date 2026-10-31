@@ -1,7 +1,8 @@
 'use strict';
 
 // Device agent: keeps one WebSocket open to the proxy and bridges each
-// multiplexed stream to the local SSH server.
+// multiplexed stream to a local TCP port: the SSH server unless the stream
+// names another port, which must be listed in ALLOWED_PORTS.
 
 const fs = require('fs');
 const WebSocket = require('ws');
@@ -13,8 +14,12 @@ const config = {
   token: required('AGENT_TOKEN'),
   caFile: process.env.CA_FILE || '',
   sshHost: process.env.SSH_HOST || '127.0.0.1',
-  sshPort: Number(process.env.SSH_PORT || 22),
+  sshPort: port(process.env.SSH_PORT || '22', 'SSH_PORT'),
 };
+// Only the SSH server by default; other services are opt-in per device.
+config.allowedPorts = new Set(
+  (process.env.ALLOWED_PORTS || String(config.sshPort)).split(',').map((p) => port(p.trim(), 'ALLOWED_PORTS')),
+);
 
 // The proxy pings every 20s; assume the link is dead after missing a few.
 const HEARTBEAT_TIMEOUT_MS = 60_000;
@@ -27,6 +32,15 @@ function required(name) {
     process.exit(1);
   }
   return v;
+}
+
+function port(s, name) {
+  const n = Number(s);
+  if (!/^[0-9]+$/.test(s) || n < 1 || n > 65535) {
+    console.error(`agent: ${name}: invalid port ${JSON.stringify(s)}`);
+    process.exit(1);
+  }
+  return n;
 }
 
 function log(msg) {
@@ -56,10 +70,16 @@ function connect() {
   };
 
   ws.on('open', () => {
-    log(`connected to ${url.origin}, forwarding to ${config.sshHost}:${config.sshPort}`);
+    const ports = [...config.allowedPorts].join(',');
+    log(`connected to ${url.origin}, forwarding to ${config.sshHost} ports ${ports} (ssh ${config.sshPort})`);
     backoff = 1000;
     resetHeartbeat();
-    new Mux(ws, { targetHost: config.sshHost, targetPort: config.sshPort, log });
+    new Mux(ws, {
+      targetHost: config.sshHost,
+      defaultPort: config.sshPort,
+      allowedPorts: config.allowedPorts,
+      log,
+    });
   });
   ws.on('ping', resetHeartbeat);
   ws.on('error', (err) => log(`connection error: ${err.message || err.code}`));

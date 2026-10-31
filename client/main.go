@@ -32,9 +32,10 @@ Commands:
   cp <src> <dst>             copy a file, scp style; one side is <device>:<path>
                              e.g. sshtun cp app.tar dev1:/tmp/
                                   sshtun cp dev1:/tmp/app.tar .
-  tun [-ip addr] <device>    give the device an IP address on this machine
-                             (default 10.77.0.2) until Ctrl-C, so ssh, scp
-                             and ping work against it directly; needs root
+  tun [-ip addr] <device>    give the device an IP address and a name
+                             (10.77.0.2, <device>.sshtun) until Ctrl-C, so
+                             ssh, ping and any TCP port the device allows
+                             work against it directly; needs root
 
 Authentication tries the identity key first, then prompts for a password if
 the server allows it. SSHTUN_PASSWORD supplies the password non-interactively.

@@ -36,10 +36,11 @@ function u32(n) {
 }
 
 class Mux {
-  constructor(ws, { targetHost, targetPort, log }) {
+  constructor(ws, { targetHost, defaultPort, allowedPorts, log }) {
     this.ws = ws;
     this.targetHost = targetHost;
-    this.targetPort = targetPort;
+    this.defaultPort = defaultPort; // for OPEN without a port: the SSH server
+    this.allowedPorts = allowedPorts;
     this.log = log;
     this.streams = new Map();
 
@@ -64,11 +65,11 @@ class Mux {
 
     switch (type) {
       case FRAME.OPEN:
-        if (payload.length !== 4) {
-          this.send(FRAME.OPEN_FAIL, id, Buffer.from('OPEN without receive window'));
+        if (payload.length !== 4 && payload.length !== 6) {
+          this.send(FRAME.OPEN_FAIL, id, Buffer.from('malformed OPEN'));
           break;
         }
-        this.open(id, payload.readUInt32BE(0));
+        this.open(id, payload.readUInt32BE(0), payload.length === 6 ? payload.readUInt16BE(4) : this.defaultPort);
         break;
       case FRAME.DATA:
         if (stream) stream.onData(payload);
@@ -84,7 +85,12 @@ class Mux {
     }
   }
 
-  open(id, sendWindow) {
+  open(id, sendWindow, port) {
+    if (!this.allowedPorts.has(port)) {
+      this.log(`stream ${id}: refused port ${port}`);
+      this.send(FRAME.OPEN_FAIL, id, Buffer.from(`port ${port} not allowed`));
+      return;
+    }
     if (this.streams.has(id)) {
       this.send(FRAME.OPEN_FAIL, id, Buffer.from('stream id in use'));
       return;
@@ -93,7 +99,7 @@ class Mux {
       this.send(FRAME.OPEN_FAIL, id, Buffer.from('too many streams'));
       return;
     }
-    this.streams.set(id, new Stream(this, id, sendWindow));
+    this.streams.set(id, new Stream(this, id, sendWindow, port));
   }
 
   destroyAll() {
@@ -103,7 +109,7 @@ class Mux {
 }
 
 class Stream {
-  constructor(mux, id, sendWindow) {
+  constructor(mux, id, sendWindow, port) {
     this.mux = mux;
     this.id = id;
     this.sendWindow = sendWindow; // credit we have with the proxy, as it advertised
@@ -113,13 +119,13 @@ class Stream {
     this.localEnded = false;
     this.done = false;
 
-    const socket = net.connect({ host: mux.targetHost, port: mux.targetPort });
+    const socket = net.connect({ host: mux.targetHost, port });
     this.socket = socket;
     socket.setNoDelay(true);
 
     socket.on('connect', () => {
       this.connected = true;
-      mux.log(`stream ${id}: opened`);
+      mux.log(`stream ${id}: opened to port ${port}`);
       mux.send(FRAME.OPEN_OK, id, u32(INITIAL_WINDOW));
     });
     socket.on('data', (chunk) => {

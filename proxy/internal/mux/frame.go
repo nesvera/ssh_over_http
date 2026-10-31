@@ -8,6 +8,8 @@
 //	+--------+-------------------+-------------------+
 //
 // The proxy opens streams (OPEN); the agent answers OPEN_OK or OPEN_FAIL.
+// OPEN may name a TCP port on the device; without one the agent connects to
+// its SSH server, so agents that predate ports keep working for SSH.
 // DATA is flow controlled per stream and per direction: OPEN and OPEN_OK each
 // advertise the sender's receive window, the peer may have at most that many
 // unacknowledged bytes in flight, and the receiver returns credit with WINDOW
@@ -21,7 +23,7 @@ package mux
 import "encoding/binary"
 
 const (
-	FrameOpen     byte = 0x01 // proxy -> agent, payload: uint32 BE receive window
+	FrameOpen     byte = 0x01 // proxy -> agent, payload: uint32 BE receive window [, uint16 BE port]
 	FrameOpenOK   byte = 0x02 // agent -> proxy, payload: uint32 BE receive window
 	FrameOpenFail byte = 0x03 // agent -> proxy, payload: UTF-8 reason
 	FrameData     byte = 0x04 // both ways, payload: stream bytes

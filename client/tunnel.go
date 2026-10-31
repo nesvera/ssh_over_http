@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -69,13 +70,18 @@ func authHeader(cfg *config) http.Header {
 	return http.Header{"Authorization": {"Bearer " + cfg.token}}
 }
 
-// dialTunnel returns a byte stream to the device's SSH server.
-func dialTunnel(ctx context.Context, cfg *config, device string) (net.Conn, error) {
+// dialTunnel returns a byte stream to a TCP port on the device; port 0 means
+// the device's SSH server. The device's agent decides which ports it allows.
+func dialTunnel(ctx context.Context, cfg *config, device string, port uint16) (net.Conn, error) {
 	hc, err := httpClient(cfg)
 	if err != nil {
 		return nil, err
 	}
-	u, err := endpoint(cfg, "/connect", url.Values{"device": {device}}, true)
+	query := url.Values{"device": {device}}
+	if port != 0 {
+		query.Set("port", strconv.Itoa(int(port)))
+	}
+	u, err := endpoint(cfg, "/connect", query, true)
 	if err != nil {
 		return nil, err
 	}

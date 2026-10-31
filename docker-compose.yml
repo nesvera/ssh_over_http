@@ -23,6 +23,9 @@ services:
       DEVICE_ID: "${DEVICE_ID}"
       AGENT_TOKEN: "${AGENT_TOKEN}"
       CA_FILE: /secrets/ca.crt
+      # TCP ports clients may reach on the device (see target/agent).
+      # SSH only unless .env sets e.g. ALLOWED_PORTS=22,8080.
+      ALLOWED_PORTS: "${ALLOWED_PORTS:-22}"
       # Password-login user created at startup (see target/entrypoint.sh).
       TARGET_USER: "${TARGET_USER}"
       TARGET_PASSWORD: "${TARGET_PASSWORD}"

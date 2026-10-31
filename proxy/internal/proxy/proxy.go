@@ -6,10 +6,12 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -83,6 +85,11 @@ func (p *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	device := r.URL.Query().Get("device")
+	port, err := parsePort(r.URL.Query().Get("port"))
+	if err != nil {
+		http.Error(w, "invalid port", http.StatusBadRequest)
+		return
+	}
 	sess := p.lookup(device)
 	if sess == nil {
 		http.Error(w, "device not connected", http.StatusNotFound)
@@ -91,11 +98,16 @@ func (p *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	// Open the stream before upgrading so failures surface as HTTP errors.
 	ctx, cancel := context.WithTimeout(r.Context(), openTimeout)
-	st, err := sess.Open(ctx)
+	st, err := sess.Open(ctx, port)
 	cancel()
 	if err != nil {
-		log.Printf("connect %s: open stream: %v", device, err)
-		http.Error(w, "could not reach device ssh server", http.StatusBadGateway)
+		log.Printf("connect %s port %d: open stream: %v", device, port, err)
+		msg := "could not reach device"
+		var refused *mux.RefusedError
+		if errors.As(err, &refused) {
+			msg += ": " + refused.Reason
+		}
+		http.Error(w, msg, http.StatusBadGateway)
 		return
 	}
 	c, err := websocket.Accept(w, r, nil)
@@ -105,10 +117,10 @@ func (p *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c.SetReadLimit(clientMaxFrame)
-	log.Printf("connect %s: session opened for %s", device, r.RemoteAddr)
+	log.Printf("connect %s port %d: session opened for %s", device, port, r.RemoteAddr)
 
 	pipe(websocket.NetConn(r.Context(), c, websocket.MessageBinary), st)
-	log.Printf("connect %s: session closed for %s", device, r.RemoteAddr)
+	log.Printf("connect %s port %d: session closed for %s", device, port, r.RemoteAddr)
 }
 
 func (p *Server) handleDevices(w http.ResponseWriter, r *http.Request) {
@@ -211,6 +223,19 @@ func pipe(a, b io.ReadWriteCloser) {
 	a.Close()
 	b.Close()
 	<-done
+}
+
+// parsePort reads the optional port query parameter; 0 (absent) means the
+// device's SSH server.
+func parsePort(s string) (uint16, error) {
+	if s == "" {
+		return 0, nil
+	}
+	n, err := strconv.ParseUint(s, 10, 16)
+	if err != nil || n == 0 {
+		return 0, errors.New("invalid port")
+	}
+	return uint16(n), nil
 }
 
 func bearer(r *http.Request) string {

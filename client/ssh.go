@@ -26,7 +26,7 @@ func connect(ctx context.Context, cfg *config, device string) (*ssh.Client, erro
 		return nil, fmt.Errorf("known_hosts: %w", err)
 	}
 
-	conn, err := dialTunnel(ctx, cfg, device)
+	conn, err := dialTunnel(ctx, cfg, device, 0)
 	if err != nil {
 		return nil, err
 	}
